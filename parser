@@ -1,0 +1,187 @@
+import time
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+import pandas as pd
+import datetime
+import sqlalchemy
+import logging 
+import os
+import configparser
+import re
+
+logging.basicConfig(filename='logs/{}_{}.txt'.format(os.getpid(), datetime.datetime.now().strftime('%Y-%m-%d')),
+                    filemode='a',
+                    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
+                    datefmt='%H:%M:%S',
+                    level=logging.INFO)
+
+config = configparser.ConfigParser()
+config.read('config.ini')
+api_url = 'https://api.superjob.ru/2.0/vacancies/'
+base_url = 'https://russia.superjob.ru/vacancy/search/?click_from=facet&period=3&payment_defined=1'
+api_key = {'X-Api-App-Id': config['API']['key']}
+headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36'}
+REQUEST_TIMEOUT = (5, 25)
+API_TIMEOUT = (5, 25)
+
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504]
+)
+try:
+    retry_strategy.allowed_methods = frozenset(['HEAD', 'GET', 'OPTIONS'])
+except AttributeError:
+    retry_strategy.method_whitelist = frozenset(['HEAD', 'GET', 'OPTIONS'])
+http_session = requests.Session()
+adapter = HTTPAdapter(max_retries=retry_strategy)
+http_session.mount("https://", adapter)
+http_session.mount("http://", adapter)
+
+def connect_db():
+    config = configparser.ConfigParser()
+    config.read('/opt/parser_jobsites/parser_jobsites/config.ini')
+    hostname = config['DATABASE']['hostname']
+    username = config['DATABASE']['username']
+    password = config['DATABASE']['password']
+    database = config['DATABASE']['database']
+    try: 
+        return sqlalchemy.create_engine('postgresql+psycopg2://{}:{}@{}/{}'.format(username, password, hostname, database))
+    except: 
+        logging.exception('Error connect database')
+        return None
+
+def get_link(): 
+    connection = connect_db()
+    connection_raw = connection.raw_connection()
+    cur = connection_raw.cursor()
+    cur.execute("SELECT V.EXTERNAL_ID FROM ODS_SITES.VACANCIES V WHERE V.VACANCY_SOURCE = 'superjob' AND V.DATE_UPLOAD::DATE BETWEEN DATE_TRUNC('month', CURRENT_DATE) AND CURRENT_DATE")
+    return [i[0] for i in cur.fetchall()]
+
+def get_key_words(): 
+    connection = connect_db()
+    connection_raw = connection.raw_connection()
+    cur = connection_raw.cursor()
+    cur.execute("SELECT DISTINCT S.WORD FROM ODS_MAN.SEARCH_WORDS S WHERE S.WORD IS NOT NULL ")
+    return [i[0] for i in cur.fetchall()]
+
+# Получаем ID вакансий по ключевому слову
+def get_vacancy_ids(keyword):
+
+    list_ids = get_link()
+    page = 1
+    while True:
+        url = "{}&keywords={}&page={}".format(base_url, keyword, page)
+        try:
+            response = http_session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+        except requests.exceptions.Timeout:
+            logging.warning('[TIMEOUT] Request timeout. URL: {}'.format(url))
+            break
+        except requests.RequestException as e:
+            logging.warning('[ERROR] Request error. URL: {} | {}'.format(url, str(e)))
+            break
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        page_items = soup.select("div.f-test-search-result-item")
+
+        if not page_items:
+            break
+
+        for item in page_items:
+                vac_link = item.select_one("a[href*='/vakansii/']")
+                try: # сразу достаем период оплаты
+                    vac_pay_period = item.select_one("div.f-test-text-company-item-salary span:nth-of-type(2)")
+                    pay_period = vac_pay_period.text.strip().replace('/', '')
+                except: 
+                    pay_period = None
+                if vac_link:
+                    vac_name = vac_link.text.lower()
+
+                    if keyword.lower() in vac_name:
+                        vac_url = vac_link['href']
+                        vac_id = int(vac_url.split('-')[-1].split('.')[0])
+
+                        if vac_id not in list_ids:
+                            list_ids.append(vac_id)
+                            yield [vac_id, pay_period]
+
+        next_page = soup.select_one("a.f-test-button-dalshe[href]")
+        if not next_page:
+            break
+
+        page += 1
+
+def get_vacancy_details(vac_id, vac_pay_period):
+    url = "{}{}/".format(api_url, vac_id)
+    try:
+        response = http_session.get(url, headers=api_key, timeout=API_TIMEOUT)
+        response.raise_for_status()
+    except requests.exceptions.Timeout:
+        logging.warning('[TIMEOUT] Vacancy detail request timeout for id {}'.format(vac_id))
+        return None
+    except requests.RequestException as e:
+        logging.error('[ERROR] Requests error for id {}: {}'.format(vac_id, str(e)))
+        return None
+    vacancy_details_data = response.json()
+    # описание вакансии
+    TAG_RE = re.compile(r'<[^>]+>')
+    try: 
+        description = TAG_RE.sub('', vacancy_details_data.get('vacancyRichText')).replace('\n', '').replace('\r', '')
+    except: 
+        description = ''
+    # ЗП
+    salary_from = vacancy_details_data.get('payment_from')
+    salary_to = vacancy_details_data.get('payment_to')
+    if salary_from == 0 or salary_to == 0:
+        if salary_from == 0: 
+            salary_from = salary_to 
+        else: 
+            salary_to = salary_from
+    #data =
+    return {
+        'external_id': vacancy_details_data.get('link'),
+        'employer': vacancy_details_data.get('firm_name'),
+        'vacancy_name': vacancy_details_data.get('profession'), 
+        'description': description, 
+        'type_schedule': vacancy_details_data.get('type_of_work', {}).get('title'), 
+        'publish_dt': vacancy_details_data.get('date_published'), 
+        'vacancy_source': 'superjob', 
+        'location_source':  vacancy_details_data.get('address', None) or vacancy_details_data.get('town', {}).get('title'),
+        'location_region': None, 
+        'location_city': None, 
+        'location_coordinates': [
+                                vacancy_details_data.get('latitude'),
+                                vacancy_details_data.get('longitude')
+                                ], 
+        'salary_min': salary_from,
+        'salary_max': salary_to,
+        'salary_type': None,
+        'schedule': vacancy_details_data.get('schedule'),
+        'source_id': vacancy_details_data.get('id'),
+        'vacancy_activity': [n['title'] for n in vacancy_details_data.get('catalogues', [])] if vacancy_details_data.get('catalogues') else None,
+        'employer_id': vacancy_details_data.get('id_client'),
+        'driver_license_types': None,
+        'pay_period': vac_pay_period,
+    }
+if __name__ == '__main__':
+    conn_db = connect_db()
+    keywords_list = get_key_words()
+    results = []
+    for keyword in keywords_list:
+        logging.info('Parse key word: {}'.format(keyword))
+        for vac_info in get_vacancy_ids(keyword):
+            vacancy_data = get_vacancy_details(vac_info[0], vac_info[1])
+            if vacancy_data:
+                results.append(vacancy_data)
+                logging.info('[OK] URL: {}'.format(vacancy_data.get('external_id')))
+            time.sleep(0.3)
+            if len(results) == 100:
+                pd.json_normalize(results).to_sql('vacancies', schema='ods_sites', con=conn_db, if_exists='append', index=False)
+                results.clear()
+                logging.debug('Add chunk database and clear list - OK')
+                time.sleep(10)
+    if len(results) > 0: 
+        pd.json_normalize(results).to_sql('vacancies', schema='ods_sites', con=conn_db, if_exists='append', index=False)
