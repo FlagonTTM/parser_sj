@@ -25,6 +25,8 @@ api_key = {'X-Api-App-Id': config['API']['key']}
 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36'}
 REQUEST_TIMEOUT = (5, 25)
 API_TIMEOUT = (5, 25)
+PAGE_WARN_THRESHOLD = 60  # seconds
+VACANCY_WARN_THRESHOLD = 60  # seconds
 
 retry_strategy = Retry(
     total=3,
@@ -73,6 +75,8 @@ def get_vacancy_ids(keyword):
     list_ids = get_link()
     page = 1
     while True:
+        page_start = time.monotonic()
+        new_ids_on_page = 0
         url = "{}&keywords={}&page={}".format(base_url, keyword, page)
         try:
             response = http_session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -106,12 +110,19 @@ def get_vacancy_ids(keyword):
 
                         if vac_id not in list_ids:
                             list_ids.append(vac_id)
+                            new_ids_on_page += 1
                             yield [vac_id, pay_period]
 
         next_page = soup.select_one("a.f-test-button-dalshe[href]")
         if not next_page:
             break
 
+        elapsed_page = time.monotonic() - page_start
+        logging.debug('[PAGE_DONE] keyword=%s page=%s duration=%.2fs new_ids=%s',
+                      keyword, page, elapsed_page, new_ids_on_page)
+        if elapsed_page > PAGE_WARN_THRESHOLD:
+            logging.warning('[SLOW_PAGE] keyword=%s page=%s duration=%.2fs',
+                            keyword, page, elapsed_page)
         page += 1
 
 def get_vacancy_details(vac_id, vac_pay_period):
@@ -167,21 +178,44 @@ def get_vacancy_details(vac_id, vac_pay_period):
         'pay_period': vac_pay_period,
     }
 if __name__ == '__main__':
+    logging.info('[START] SuperJob parser launched')
     conn_db = connect_db()
+    if conn_db is None:
+        logging.error('[STOP] Database connection failed. Exit.')
+        raise SystemExit(1)
     keywords_list = get_key_words()
+    logging.info('[INFO] Loaded %s keywords', len(keywords_list))
     results = []
     for keyword in keywords_list:
         logging.info('Parse key word: {}'.format(keyword))
+        processed_vacancies = 0
+        keyword_start = time.monotonic()
         for vac_info in get_vacancy_ids(keyword):
+            vac_start = time.monotonic()
             vacancy_data = get_vacancy_details(vac_info[0], vac_info[1])
+            vac_duration = time.monotonic() - vac_start
+            if vac_duration > VACANCY_WARN_THRESHOLD:
+                logging.warning('[SLOW_VACANCY] keyword=%s id=%s duration=%.2fs',
+                                keyword, vac_info[0], vac_duration)
+            else:
+                logging.debug('[VACANCY_DONE] keyword=%s id=%s duration=%.2fs',
+                              keyword, vac_info[0], vac_duration)
             if vacancy_data:
                 results.append(vacancy_data)
+                processed_vacancies += 1
                 logging.info('[OK] URL: {}'.format(vacancy_data.get('external_id')))
+            else:
+                logging.debug('[SKIP] Vacancy %s skipped', vac_info[0])
             time.sleep(0.3)
             if len(results) == 100:
+                logging.debug('[DB] Writing chunk of %s vacancies', len(results))
                 pd.json_normalize(results).to_sql('vacancies', schema='ods_sites', con=conn_db, if_exists='append', index=False)
                 results.clear()
                 logging.debug('Add chunk database and clear list - OK')
                 time.sleep(10)
-    if len(results) > 0: 
+        logging.debug('[KEYWORD_STATS] processed=%s keyword=%s duration=%.2fs',
+                      processed_vacancies, keyword, time.monotonic() - keyword_start)
+    if len(results) > 0:
+        logging.debug('[DB] Final flush with %s vacancies', len(results))
         pd.json_normalize(results).to_sql('vacancies', schema='ods_sites', con=conn_db, if_exists='append', index=False)
+    logging.info('[FINISH] SuperJob parser completed')
